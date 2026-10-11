@@ -1,0 +1,147 @@
+# Named, documented assumptions for Phase 1 (ingestion + book reconstruction).
+# See reference/01_ingestion_and_book.md for what each value means and why it was chosen.
+
+data:
+  message_file: data/raw/AAPL_2012-06-21_34200000_57600000_message_10.csv
+  orderbook_file: data/raw/AAPL_2012-06-21_34200000_57600000_orderbook_10.csv
+  # Number of price levels per side in the LOBSTER orderbook file above.
+  orderbook_levels: 10
+  # LOBSTER prices are dollars * price_scale (e.g. 5853300 == $585.33).
+  price_scale: 10000
+
+book:
+  # Take a full-book snapshot every N applied events, so a long replay has
+  # bounded-memory audit points instead of only the running live state.
+  checkpoint_interval: 100000
+
+ingest:
+  # Rows read from the message file per streamed chunk. Keeps peak memory
+  # bounded regardless of file size; does not affect correctness.
+  chunk_size: 10000
+
+features:
+  # Trailing event-count windows every microstructure feature is
+  # aggregated over (event-based, not time-based -- see reference/02_features.md).
+  windows: [5, 10, 20, 50]
+  # Depth (price levels per side) used for weighted_microprice/
+  # liquidity_pressure. microprice/queue_imbalance use only L1 (best bid/
+  # ask); this is half of the available Level-10 depth -- enough to add
+  # information beyond L1 without needing a full depth-slope model.
+  microprice_depth: 5
+  output_file: data/features/features.parquet
+
+labels:
+  # Event-count forecast horizons the classification label looks ahead
+  # (event-based, matching features.py's event-count windows -- not
+  # time-based). See reference/03_labels_and_baselines.md.
+  horizons: [5, 10, 100]
+  # Relative-midprice-return threshold below which a horizon's move counts
+  # as "flat" (label 0) instead of directional (+-1). This sample's tick
+  # size is $0.01 (100 raw price units at price_scale=10000) and its mean
+  # midprice is ~$585.09, so one tick is a ~1.71e-5 relative move;
+  # epsilon=1e-5 (~0.58 ticks) keeps sub-tick noise out of the directional
+  # classes without requiring a full tick move to count as "moved" --
+  # verified against the resulting label distribution in
+  # reference/03_labels_and_baselines.md.
+  epsilon: 0.00001
+
+evaluate:
+  # Number of walk-forward (expanding-window) folds to split the day's
+  # events into. With ~400k events this gives ~5 test windows of ~67k
+  # events each -- enough per fold for a stable IC estimate. Purge length
+  # is not a separate assumption: it's derived as max(labels.horizons) in
+  # evaluate.py, so it can never drift out of sync with the labels it's
+  # protecting against leakage from.
+  n_splits: 5
+
+model:
+  # Hyperparameters for the two Phase 4 classifiers in model.py, both
+  # retrained fresh on every walk-forward fold (see
+  # reference/04_model_and_evaluation.md). Kept modest since they're refit
+  # ~100+ times (2 models x 3 horizons x 5 folds, plus 5 ablations x 3
+  # horizons x 5 folds) over the full day.
+  logistic_regression:
+    max_iter: 1000
+    # Inverse L2 regularization strength (sklearn default) -- not tuned,
+    # this is a baseline, not the model being optimized.
+    C: 1.0
+  xgboost:
+    n_estimators: 150
+    max_depth: 4
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+
+backtest:
+  # Which (model, horizon) pair from model.py feeds live predictions into
+  # the Phase 5 replay. xgboost @ h=5 is model.py's best-performing pair
+  # (IC 0.0633, see reference/04_model_and_evaluation.md) and the shortest
+  # horizon, giving the replay the freshest, most frequent signal.
+  model: xgboost
+  horizon: 5
+
+  # Shares per signal. Every trade uses this fixed size -- there is no
+  # position-sizing or capital-allocation model; that's out of scope for
+  # Phase 5 (YAGNI: nothing downstream needs variable sizing yet).
+  position_size: 100
+
+  # One-way delay between a signal firing and its order reaching the
+  # matching engine. LOBSTER carries no network-latency field, so this is
+  # an assumed, named constant standing in for a colo-to-matching-engine
+  # round trip on the commodity (non-fiber, non-FPGA) hardware realistic
+  # for this sample's 2012 date.
+  latency_seconds: 0.0005
+
+  # Flat exchange/broker fee charged once per filled trade, for both
+  # order types -- a simplified stand-in for a real maker/taker fee
+  # schedule (which would rebate passive fills and charge aggressive
+  # ones differently; not modeled here).
+  fee_per_share: 0.0005
+
+  # Adverse price movement applied only to aggressive fills, in ticks,
+  # approximating market impact / price drift during the aggressor's
+  # execution window. Passive fills execute at their own quoted resting
+  # price by construction, so slippage does not apply to them.
+  slippage_ticks: 1
+
+  # Assumed half-spread (raw price units) an aggressive order pays to
+  # cross, applied around the *midprice* rather than the live
+  # best_bid/best_ask. Why not just use the live quote: this sample's
+  # book.py reconstruction has a valid (uncrossed) best_bid/best_ask on
+  # only ~1.2% of the day's events (indices 0-5,121 -- see the
+  # `crossed_book` invariant count in reference/01_ingestion_and_book.md); for
+  # the remaining ~98.8%, book.py's best_ask/best_bid can be a stale,
+  # out-of-money price from a never-cancelled order outside the Level-10
+  # depth window, so crossing it directly would fabricate a fictitious
+  # risk-free trade rather than model a real one. 1200 (=12 ticks, $0.12)
+  # is the median observed spread during the day's ~1.2% valid window --
+  # an empirically grounded stand-in for the other ~98.8%. See
+  # reference/05_replay_and_costs.md for the full derivation and its effect on
+  # the paper-trading results.
+  assumed_half_spread_raw: 1200
+
+  # LOBSTER integer price units are dollars * price_scale (data.price_scale
+  # above); this sample's tick size is $0.01 = 100 raw units -- the same
+  # tick-size fact labels.py's epsilon derivation is based on.
+  tick_size_raw: 100
+
+  # "aggressive" crosses the spread immediately on arrival and pays
+  # slippage_ticks; "passive" rests at the best price on its own side and
+  # must wait out queue position (see backtest.py) before it fills, with
+  # no slippage but the risk of never filling or losing queue position.
+  order_type: aggressive
+
+  # Trading days assumed per year, used only to annualize the Sharpe
+  # ratio computed from this single day's per-trade PnL series.
+  trading_days_per_year: 252
+
+viz:
+  # Directory PNGs from viz.py are written to (gitignored, regenerated by
+  # running `python viz.py`). See reference/06_visualization.md.
+  output_dir: reports/figures
+  # Number of leading events plotted by plot_book_evolution -- large
+  # enough to span both the day's ~1.3% genuinely uncrossed opening
+  # window (see backtest.assumed_half_spread_raw's derivation above) and
+  # the point where it becomes permanently crossed, so the plot shows the
+  # transition, not just one regime.
+  book_evolution_events: 8000
